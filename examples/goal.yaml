@@ -1,0 +1,6 @@
+environment: demo
+
+# Changes are read before planning the next operation.
+apiVersion: v1
+dataset: sample-v1
+requireIntegrationTest: true
