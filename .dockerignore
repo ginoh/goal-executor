@@ -1,0 +1,7 @@
+*
+!cmd/
+!cmd/demo-api/
+!cmd/demo-api/main.go
+!examples/
+!examples/demo/
+!examples/demo/Dockerfile
