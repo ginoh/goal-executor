@@ -37,7 +37,11 @@ func TestCleanupRejectsUnownedResourcesBeforeMutation(t *testing.T) {
 						return []byte("network-id"), nil
 					}
 					if args[1] == "inspect" {
-						return []byte("different-owner|test|net"), nil
+						networkOwner := owner
+						if unowned == "net" {
+							networkOwner = "different-owner"
+						}
+						return []byte(networkOwner + "|test|net"), nil
 					}
 				}
 				if args[0] == "container" && args[1] == "ls" {
