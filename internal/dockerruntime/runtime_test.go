@@ -6,10 +6,13 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/ginoh/goal-executor/internal/buildinput"
+	"github.com/ginoh/goal-executor/internal/goalfile"
 	"github.com/ginoh/goal-executor/internal/planning"
 )
 
@@ -19,144 +22,163 @@ func (f transport) RoundTrip(req *http.Request) (*http.Response, error) { return
 
 func newTestRuntime(t *testing.T) *Runtime {
 	t.Helper()
-	r, err := New(Config{DBImage: "postgres:test", APIImage: "api:test", OperationTimeout: time.Second})
+	body := "hello"
+	r, err := New(Config{Environment: "test", Build: buildinput.Snapshot{Dir: "/tmp/build", Dockerfile: "Dockerfile", ID: "abc"}, Application: goalfile.Application{Port: 8080}, Checks: goalfile.Checks{Readiness: goalfile.Check{HTTP: goalfile.HTTPCheck{Path: "/health", Status: 200}}, Verification: goalfile.Check{HTTP: goalfile.HTTPCheck{Path: "/message", Status: 200, BodyEquals: &body}}}, OperationTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return r
 }
 
-func TestCleanupRejectsUnownedResourcesBeforeMutation(t *testing.T) {
-	for _, unowned := range []string{"api", "db", "net"} {
-		t.Run(unowned, func(t *testing.T) {
-			r := newTestRuntime(t)
-			mutations := 0
-			r.command = func(_ context.Context, _ string, args ...string) ([]byte, error) {
-				if args[0] == "network" {
-					if args[1] == "ls" {
-						return []byte("network-id"), nil
-					}
-					if args[1] == "inspect" {
-						networkOwner := owner
-						if unowned == "net" {
-							networkOwner = "different-owner"
-						}
-						return []byte(networkOwner + "|test|net"), nil
-					}
-				}
-				if args[0] == "container" && args[1] == "ls" {
-					if strings.Contains(strings.Join(args, " "), "-api$") {
-						return []byte("api-id"), nil
-					}
-					return []byte("db-id"), nil
-				}
-				if args[0] == "container" && args[1] == "inspect" {
-					role := strings.TrimSuffix(args[len(args)-1], "-id")
-					c := container{ID: role + "-id", Owner: owner, Environment: "test", Role: role, Running: true}
-					if role == unowned {
-						c.Owner = "someone-else"
-					}
-					return json.Marshal(c)
-				}
-				mutations++
-				return nil, nil
-			}
-			if err := r.Cleanup(context.Background(), "test"); err == nil || mutations != 0 {
-				t.Fatalf("err=%v mutations=%d", err, mutations)
-			}
-		})
+func TestCleanupRejectsUnownedBeforeMutation(t *testing.T) {
+	r := newTestRuntime(t)
+	mutations := 0
+	r.command = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if args[0] == "container" && args[1] == "ls" {
+			return []byte("app-id"), nil
+		}
+		if args[0] == "container" && args[1] == "inspect" {
+			return []byte(`{"id":"app-id","owner":"someone-else","environment":"test","role":"app"}`), nil
+		}
+		mutations++
+		return nil, nil
+	}
+	if err := r.Cleanup(context.Background(), "test"); err == nil || mutations != 0 {
+		t.Fatalf("err=%v mutations=%d", err, mutations)
 	}
 }
 
-func TestObservationFailureIsNotAbsence(t *testing.T) {
+func TestEvidenceRequiresSameContainerAndStartTime(t *testing.T) {
+	r := newTestRuntime(t)
+	id, start, imageID := "app-id", "start-1", "sha256:image-1"
+	r.command = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if args[0] == "image" && args[1] == "ls" {
+			return []byte("image-id"), nil
+		}
+		if args[0] == "image" && args[1] == "inspect" {
+			return json.Marshal(image{ID: imageID, Owner: owner, Environment: "test", InputID: "abc"})
+		}
+		if args[0] == "container" && args[1] == "ls" {
+			return []byte("app-id"), nil
+		}
+		if args[0] == "container" && args[1] == "inspect" {
+			return []byte(`{"id":"` + id + `","started":"` + start + `","owner":"` + owner + `","environment":"test","role":"app","running":true,"imageID":"` + imageID + `","port":"8080","ports":{"8080/tcp":[{"HostIP":"127.0.0.1","HostPort":"18080"}]}}`), nil
+		}
+		return nil, errors.New("unexpected docker command")
+	}
+	message := "hello"
+	r.client = &http.Client{Transport: transport(func(req *http.Request) (*http.Response, error) {
+		body := message
+		if req.URL.Path == "/health" {
+			body = ""
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	if err := r.Execute(context.Background(), "test", planning.Action{Kind: planning.VerifyApp}); err != nil {
+		t.Fatal(err)
+	}
+	s, err := r.Observe(context.Background(), "test")
+	if err != nil || !s.TestValid {
+		t.Fatalf("expected valid evidence: %+v %v", s, err)
+	}
+	start = "start-2"
+	s, err = r.Observe(context.Background(), "test")
+	if err != nil || s.TestValid {
+		t.Fatalf("restart retained evidence: %+v %v", s, err)
+	}
+	if err := r.Execute(context.Background(), "test", planning.Action{Kind: planning.VerifyApp}); err != nil {
+		t.Fatal(err)
+	}
+	id = "app-id-new"
+	s, err = r.Observe(context.Background(), "test")
+	if err != nil || s.TestValid {
+		t.Fatalf("replacement retained evidence: %+v %v", s, err)
+	}
+	message = "wrong"
+	if err := r.Execute(context.Background(), "test", planning.Action{Kind: planning.VerifyApp}); err == nil {
+		t.Fatal("accepted unexpected verification response")
+	}
+}
+
+func TestObservationErrorIsNotAbsence(t *testing.T) {
 	r := newTestRuntime(t)
 	failure := errors.New("daemon unavailable")
 	r.command = func(context.Context, string, ...string) ([]byte, error) { return nil, failure }
 	if _, err := r.Observe(context.Background(), "test"); !errors.Is(err, failure) {
-		t.Fatalf("got %v", err)
+		t.Fatal(err)
 	}
 }
 
-func TestEvidenceMatchesResourceIdentityAndData(t *testing.T) {
+func TestInvalidEnvironmentDoesNotReachDocker(t *testing.T) {
 	r := newTestRuntime(t)
-	dbID, apiID, dbStart, apiStart := "db-id", "api-id", "db-start", "api-start"
-	data := Data{Version: "v1", Dataset: Dataset, Generation: "generation-1", Value: SampleValue}
+	r.command = func(context.Context, string, ...string) ([]byte, error) { t.Fatal("called Docker"); return nil, nil }
+	for _, env := range []string{"", "--all", "a/b", "other env"} {
+		if err := r.Cleanup(context.Background(), env); err == nil {
+			t.Fatalf("accepted %q", env)
+		}
+	}
+}
+
+func TestBuildUsesSnapshotDockerfileAndContext(t *testing.T) {
+	r := newTestRuntime(t)
+	var buildArgs []string
 	r.command = func(_ context.Context, _ string, args ...string) ([]byte, error) {
-		if args[0] == "container" && args[1] == "ls" {
-			if strings.Contains(strings.Join(args, " "), "-api$") {
-				return []byte("api"), nil
-			}
-			return []byte("db"), nil
-		}
-		if args[0] == "container" && args[1] == "inspect" {
-			role := args[len(args)-1]
-			c := container{ID: dbID, Started: dbStart, Owner: owner, Environment: "test", Role: role, Running: true}
-			if role == "api" {
-				// JSON keeps the fixture independent of the anonymous ports type.
-				return []byte(`{"id":"` + apiID + `","started":"` + apiStart + `","owner":"` + owner + `","environment":"test","role":"api","running":true,"ports":{"8080/tcp":[{"HostIP":"127.0.0.1","HostPort":"18080"}]}}`), nil
-			}
-			return json.Marshal(c)
-		}
-		if args[0] == "exec" && args[2] == "pg_isready" {
+		if args[0] == "image" && args[1] == "ls" {
 			return nil, nil
 		}
-		if args[0] == "exec" {
-			return json.Marshal(data)
+		if args[0] == "container" && args[1] == "ls" {
+			return nil, nil
+		}
+		if args[0] == "image" && args[1] == "build" {
+			buildArgs = append([]string(nil), args...)
+			return nil, nil
 		}
 		return nil, errors.New("unexpected command")
 	}
-	baseCommand := r.command
-	r.command = func(ctx context.Context, input string, args ...string) ([]byte, error) {
-		if strings.Contains(input, "to_regclass") {
-			return []byte("t"), nil
+	if err := r.Execute(context.Background(), "test", planning.Action{Kind: planning.BuildImage}); err != nil {
+		t.Fatal(err)
+	}
+	for i, arg := range buildArgs {
+		if arg == "--file" && i+1 < len(buildArgs) {
+			if buildArgs[i+1] != filepath.Join(r.config.Build.Dir, r.config.Build.Dockerfile) {
+				t.Fatalf("Dockerfile was not fixed: %v", buildArgs)
+			}
+			if buildArgs[len(buildArgs)-1] != r.config.Build.Dir {
+				t.Fatalf("wrong build context: %v", buildArgs)
+			}
+			return
 		}
-		return baseCommand(ctx, input, args...)
 	}
-	r.client = &http.Client{Transport: transport(func(*http.Request) (*http.Response, error) {
-		body, _ := json.Marshal(data)
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(string(body)))}, nil
-	})}
-	testAction := planning.Action{Kind: planning.RunIntegrationTest, APIVersion: "v1", Dataset: Dataset}
-	for _, change := range []struct {
-		name  string
-		apply func()
-	}{
-		{"API replacement", func() { apiID += "-new" }},
-		{"DB replacement", func() { dbID += "-new" }},
-		{"API restart", func() { apiStart += "-new" }},
-		{"DB restart", func() { dbStart += "-new" }},
-		{"data generation", func() { data.Generation += "-new" }},
-	} {
-		t.Run(change.name, func(t *testing.T) {
-			if err := r.Execute(context.Background(), "test", testAction); err != nil {
-				t.Fatal(err)
-			}
-			s, err := r.Observe(context.Background(), "test")
-			if err != nil || !s.TestValid {
-				t.Fatalf("before change: %+v %v", s, err)
-			}
-			change.apply()
-			s, err = r.Observe(context.Background(), "test")
-			if err != nil || s.TestValid {
-				t.Fatalf("stale evidence retained: %+v %v", s, err)
-			}
-		})
-	}
-	data.Value = "incorrect"
-	if err := r.Execute(context.Background(), "test", testAction); err == nil {
-		t.Fatal("accepted wrong data")
-	}
+	t.Fatalf("missing Dockerfile flag: %v", buildArgs)
 }
 
-func TestEnvironmentValidationBeforeDocker(t *testing.T) {
-	r := newTestRuntime(t)
-	r.command = func(context.Context, string, ...string) ([]byte, error) {
-		t.Fatal("Docker called for invalid name")
-		return nil, nil
-	}
-	for _, environment := range []string{"", "--all", "a/b", "other env", strings.Repeat("a", 41)} {
-		if err := r.Cleanup(context.Background(), environment); err == nil {
-			t.Fatalf("accepted %q", environment)
-		}
+func TestHTTPCheckUsesOriginalResponse(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusFound} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			r := newTestRuntime(t)
+			var app container
+			if err := json.Unmarshal([]byte(`{"ports":{"8080/tcp":[{"HostIP":"127.0.0.1","HostPort":"18080"}]}}`), &app); err != nil {
+				t.Fatal(err)
+			}
+			var paths []string
+			r.client.Transport = transport(func(req *http.Request) (*http.Response, error) {
+				paths = append(paths, req.URL.Path)
+				if req.URL.Path == "/original" {
+					return &http.Response{StatusCode: http.StatusFound, Header: http.Header{"Location": []string{"/target"}}, Body: io.NopCloser(strings.NewReader("redirect"))}, nil
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("hello"))}, nil
+			})
+			body := "redirect"
+			if status == http.StatusOK {
+				body = "hello"
+			}
+			passed, err := r.check(context.Background(), app, goalfile.HTTPCheck{Path: "/original", Status: status, BodyEquals: &body})
+			if err != nil || passed != (status == http.StatusFound) {
+				t.Fatalf("passed=%v err=%v", passed, err)
+			}
+			if len(paths) != 1 || paths[0] != "/original" {
+				t.Fatalf("followed redirect: %v", paths)
+			}
+		})
 	}
 }

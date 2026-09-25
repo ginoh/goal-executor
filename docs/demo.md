@@ -1,97 +1,100 @@
-# Dockerデモ
+# 第1段階のDockerデモ
 
 ## 準備
 
-Go 1.26.5、Docker CLI、起動済みDocker Desktopを使用します。Runtimeは常に `desktop-linux` contextを指定します。現在選択中のcontextは変更しません。
+Go 1.26.5、Docker CLI、起動済みDocker Desktopを使用します。Runtimeは常に`desktop-linux` contextを指定します。ビルド元イメージ`golang:1.26.5-alpine`が手元にない場合は、Dockerビルド時にレジストリから取得されます。
 
-以下のpull/buildはレジストリへ接続します。実行時の自動pullは行いません。
+通常の`go test ./...`はDockerへ接続しません。サンプル設定は[examples/goal.yaml](../examples/goal.yaml)です。ビルド対象のGoアプリは`cmd/demo-api/main.go`、Dockerfileは`examples/demo/Dockerfile`です。
 
-```sh
-docker --context desktop-linux pull postgres:17-alpine
-docker --context desktop-linux build -f examples/demo/Dockerfile -t goal-executor-demo:local .
-```
-
-APIのビルドには `golang:1.26.5-alpine`、実行には `postgres:17-alpine` を使用します。APIは同梱の `psql` でDBに問い合わせるため、Goの追加依存はありません。これはPoCを小さく保つ選択で、接続プールを持つ一般的なアプリケーション構成ではありません。
-
-## 1. 空の環境から構築
+## 実行
 
 ```sh
 go run ./cmd/goal-executor run --goal examples/goal.yaml --once
 ```
 
-`examples/goal.yaml` の環境名は `demo` です。他の実行と重ならない名前を使ってください。同じ環境を複数プロセスで同時に操作する用途は対象外です。
-
-標準出力はJSON Linesです。`planned` の `plan.Actions` に計画全体と理由、`executing` / `executed` に実際に実行した操作、`observed` に観測状態が出ます。空の状態なら次の順に進みます。
-
-```text
-create-db → initialize-data → deploy-api(v1) → run-integration-test(v1)
-→ planned: achieved
-```
-
-毎回計画の先頭だけを実行し、次の観測から計画を作り直します。最後の `observed` では `TestValid: true` を確認できます。
-
-APIのポートを取得し、表示された `127.0.0.1:<port>` の `/data` をブラウザまたはcurlで開けます。
+空の環境なら`build-image → deploy-app → verify-app → achieved`と進みます。標準出力はJSON Linesで、`planned`に操作列と理由、`observed`に観測状態が出ます。コンテナはlocalhostの動的ポートで公開します。
 
 ```sh
-docker --context desktop-linux port goal-executor-demo-api 8080/tcp
+docker --context desktop-linux port goal-executor-demo-app 8080/tcp
 ```
 
-応答には `version`、`dataset`、DB初期化時のUUIDである `generation`、DBから取得した `value: "hello from postgres"` が含まれます。
+表示された`127.0.0.1:<port>`の`/health`は200、`/message`は`hello`を返します。
 
-## 2. 既存DBの再利用
+同じコマンドを再実行すると、入力IDに対応するイメージと既存コンテナを再利用し、verificationを再実行します。`examples/goal.yaml`の`goal.state`を`ready`にするとreadinessまでを要求し、`verified`へ戻すとverificationを要求します。継続実行する場合は`--once`を外します。
 
-上の実行後、YAMLの `apiVersion` を `v2` に変更し、再び `run --goal examples/goal.yaml --once` を実行します。
+アプリのソースやDockerfileを変更した場合はCLIを再起動してください。次の起動で新しい入力IDを計算し、ビルド・更新します。実行中にアプリ構成や確認方法を変更すると、新しい操作を保留し再起動が必要と通知します。
 
-```text
-deploy-api(v2) → run-integration-test(v2) → achieved
-```
+## 後片付け
 
-DB作成とデータ初期化は不要と判断されます。APIの応答ではversionが変わり、generationは同じままです。後述の自動検証では、初期化済みDBだけがある状態からの起動も確認します。
-
-## 3. 操作途中の目標変更
-
-先にデモ環境を片付け、YAMLを `v1` に戻します。
-
-```sh
-go run ./cmd/goal-executor cleanup --environment demo
-go run ./cmd/goal-executor run --goal examples/goal.yaml --deploy-delay 15s
-```
-
-`executing` の `deploy-api` が表示されたら、15秒の待ち時間中にYAMLを `v2` に保存します。実行中のv1操作は完了を待ち、その次に再計画します。
-
-```text
-create-db → initialize-data → deploy-api(v1)
-→ deploy-api(v2) → run-integration-test(v2) → achieved
-```
-
-v1に対するテストは実行されません。`--deploy-delay` はこの変更を試すための待ち時間で、通常は0です。達成後も監視を続けるため、確認後はCtrl-Cで終了します。CLIを終了してから環境を片付けます。
+実行中のCLIはCtrl-Cで終了します。コンテナの削除は別コマンドです。
 
 ```sh
 go run ./cmd/goal-executor cleanup --environment demo
 ```
 
-## 自動検証
+cleanupは所有ラベルを確認してから対象コンテナを停止・削除します。イメージやビルドキャッシュは残ります。同じ環境名を複数のCLIから同時に操作する用途は対象外です。
 
-通常の `go test ./...` はDockerを操作しません。次の明示的な指定で、空の環境、初期化済みDBの再利用、操作途中のYAML変更の3ケースを実コンテナで検証します。
+## 検証の範囲
+
+`go test ./...`は入力固定、YAML検証、計画、制御ループ、Docker観測の単体テストを実行します。Dockerfileの選択変更、リダイレクトを追跡しないHTTP判定、探索の最短経路・同数時の選択順、失敗時の停止、達成後の目標変更、待機のキャンセルも確認します。
+
+第1段階の完了判定には、以下の5シナリオを使用します。同じ環境を操作するCLIを並行起動しないでください。
+
+### 手動確認の手順
+
+初回は未使用の環境名をYAMLの`environment`に設定します。以下のコマンド例は`demo`なので、変更した場合はコンテナ名・cleanupの環境名も合わせます。各シナリオで`executed`の操作列と最後の`planned`の結果を記録してください。計画に含まれた操作と実際に完了した操作を区別します。
+
+再利用・更新の比較では、各実行の前後で次を記録します。
 
 ```sh
-GOAL_EXECUTOR_DOCKER_TEST=1 go test ./cmd/goal-executor -run TestDockerScenarios -v -count=1
+docker --context desktop-linux container inspect --format '{{.Id}}|{{.State.StartedAt}}|{{.Image}}' goal-executor-demo-app
 ```
 
-各ケースは一意な `a-<scenario>-<timestamp>` の環境を作り、終了時にCLIのcleanupで削除します。失敗時もcleanupを試みます。イメージ名を変える場合は `GOAL_EXECUTOR_API_IMAGE` で指定できます。
+| シナリオ | 手順 | 期待する結果 |
+| --- | --- | --- |
+| 1. 空の環境 | ソースの応答と`bodyEquals`を`hello`、目標を`verified`にして`run --goal examples/goal.yaml --once`を実行 | `build-image → deploy-app → verify-app`が完了し、`achieved`になる。DB操作はない |
+| 2. 同じ入力の再利用 | 設定・ソースを変更せず同じコマンドを再実行 | `verify-app`だけが完了する。コンテナID・起動時刻・イメージIDは前後で一致する |
+| 3. ソース変更後の更新 | CLI終了後に`cmd/demo-api/main.go`の応答を`hello-v2`へ変更し、YAMLの`bodyEquals`も合わせて再実行 | 入力IDが変わり、ビルド・更新・検証を行う。コンテナID・イメージIDが変わり、新しい応答で`achieved`になる |
+| 4. 実行中の目標変更 | `goal.state`を`ready`にし、`--once`なしで起動。達成ログを確認してから同じファイルの`goal.state`だけを`verified`へ変更 | `ready`ではverificationを実行しない。変更後に`verify-app`を実行して達成する。コンテナID・起動時刻・イメージIDは変わらない |
+| 5. 応答不一致 | 4のCLIをCtrl-Cで終了。ソースはそのまま、YAMLの`bodyEquals`を応答と異なる値にして`--once`で再実行 | ビルド・更新せず検証が失敗し、非ゼロで終了する。`achieved`を出さない |
 
-2026-09-23にDocker Desktop（Server 28.3.2）で3ケースの成功を確認しました。既存DBのケースではコンテナIDと起動時刻の維持、目標変更のケースではv1のテストを実行せずv2のテストで達成することも検証しています。API/DBに永続volumeがないことと、検証後のコンテナ・network削除を確認しました。
+3以降は現在のソースと確認条件を使い続けます。確認後は自分が変更した応答・`bodyEquals`・`goal.state`・環境名を元の値へ戻し、検証した環境をcleanupします。ソース変更時の更新やcleanupはコンテナを停止・削除します。作成したイメージとビルドキャッシュは残ります。
 
-初回検証では `--internal` network上のAPIにホスト側ポートが割り当てられずタイムアウトしました。この環境でlocalhostからAPIへアクセスできる専用bridge networkを採用しています。
+### 補助的な自動確認
 
-## 実装の境界
+既に用意した次のテストは、初回構築と同じ入力の再利用に範囲を限定した補助確認です。5シナリオ全体の代わりにはせず、追加の自動化は手動確認後の必要性で判断します。明示的に指定した場合だけDockerを操作します。
 
-- 対応する目標はAPI `v1` / `v2` とデータセット `sample-v1`。v1/v2は同じバイナリの応答バージョンを切り替えるデモです。
-- 環境名は `[a-z][a-z0-9-]{0,39}`。コンテナ・network名は `goal-executor-<environment>-<role>` です。所有者・環境名・役割のラベルを検証し、別所有者の同名リソースは拒否します。
-- APIだけをlocalhostの動的ポートで公開し、DBは専用bridge network内でtrust認証を使用します。DBポートは公開しません。ネットワークからの外向き通信は遮断していません。ローカルの一時デモ用です。
-- DBデータはtmpfs上に置き、停止すると失われます。永続volumeは作りません。API更新時は旧APIを停止・削除してから起動するため停止時間があります。
-- 結合テスト成功はメモリ上に保持し、API/DBのコンテナID・起動時刻・APIバージョン・データセット・初期化世代・値と照合します。CLIを再起動するとテストし直します。
-- 操作成功後も実リソースを観測して達成を判定します。HTTP応答不能はAPIが存在するが未準備の状態として扱い、Dockerコマンド失敗は不在とみなさず停止します。
-- `--operation-timeout` は既定90秒。タイムアウトやCtrl-Cでもコンテナが残る場合があります。自動rollbackは行わず、確認後にcleanupします。
-- cleanupは所有リソースの検証後、コンテナのstop・通常のrm・networkのrmを行います。image、ビルドキャッシュ、volumeは削除しません。
-- Dockerエラーは操作種別と終了コードを返します。任意のコンテナ出力をログへ混入させないため、Dockerのstderrはそのまま表示しません。必要に応じて対象を限定した `docker logs --tail 30 <container>` などで調査します。
+```sh
+GOAL_EXECUTOR_DOCKER_TEST=1 go test ./cmd/goal-executor -run TestDockerScenario -v -count=1
+```
+
+このテストは一時コンテナとローカルイメージを作り、終了時にCLIのcleanupでコンテナを削除します。元イメージがない場合はレジストリから取得される可能性があります。
+
+## 2026-09-26の実Docker検証結果
+
+Docker Desktopの`desktop-linux` contextで、上記5シナリオを確認した。途中でサンプルの`.dockerignore`を修正しているため、以下は修正前後の確認を合わせた結果であり、最終構成で5シナリオすべてを通し直した記録ではない。補助的な`TestDockerScenario`も修正前に成功した。
+
+| シナリオ | 結果 |
+| --- | --- |
+| 空の環境 | `build-image → deploy-app → verify-app → achieved`。DB操作なし |
+| 同じ入力で再実行 | `verify-app`のみ。コンテナID・起動時刻・イメージIDが一致 |
+| ソース変更 | `hello`を`hello-v2`に変更すると入力IDが変わり、ビルド・コンテナ更新・検証後に達成。コンテナID・イメージIDも変化 |
+| 実行中の目標変更 | `ready → verified`で`verify-app`のみ実行し、コンテナID・起動時刻・イメージIDは維持 |
+| HTTP応答不一致 | `verify-app`が失敗し非ゼロで終了。`achieved`は出ず、コンテナID・起動時刻・イメージIDも維持 |
+
+途中、サンプルの`.dockerignore`が`examples/goal.yaml`を取り込んでおり、CLIを再起動して目標だけを変えたときに再ビルドした。`examples/goal.yaml`をビルド入力から除外して修正し、回帰テストを追加した。修正後、CLIを再起動して`verified → ready → verified`と切り替えても入力IDが一致し、ビルド・コンテナ更新は発生しなかった。
+
+セルフチェック後、修正済みの構成でソース変更後の更新を追加確認した。既存イメージを使って`hello`を返すコンテナを起動・検証した後、ソースの応答とYAMLの期待値を`hello-v3`へ変更した。YAMLはビルド入力から除外された状態で、`build-image → deploy-app → verify-app`の各`executed`と最後の`achieved`を確認した。比較値は以下のとおり（IDは先頭12文字）。
+
+| 項目 | 更新前 | 更新後 |
+| --- | --- | --- |
+| 入力ID | `7e4df03fe666` | `8cad46a395bd` |
+| コンテナID | `18709bf96fa6` | `163e222a0a1c` |
+| イメージID | `bdf5a6b0937b` | `a06ffbb822a7` |
+| 起動時刻（UTC） | `2026-09-25T16:23:04.058856711Z` | `2026-09-25T16:23:25.356129221Z` |
+
+HTTP応答不一致の確認も`.dockerignore`修正後に実施した。継続実行中の`ready → verified`は修正前の確認であり、修正後の目標切り替え確認はCLIを起動し直して実施したものとして区別する。
+
+最初のDockerビルドはSandboxが`~/.docker/buildx/.lock`と`~/.docker/contexts/meta`へのアクセスを許可しておらず失敗した。対象ディレクトリへのturn限定の権限を追加して再実行したところ成功した。Dockerfileの診断で作成した`goal-executor-stage1-diagnostic:local`と検証で作成したイメージは残る。サンプルのソースとYAMLは元の内容に戻し、`demo`コンテナはcleanup済み。
+
+入力IDはローカルのビルドファイルを識別します。ベースイメージやビルド中に取得する外部依存まで固定する再現可能ビルドではありません。verification成功はコンテナID・起動時刻・チェック内容に結び付けたメモリ上の記録で、CLI再起動後は確認し直します。

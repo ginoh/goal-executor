@@ -9,9 +9,11 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"reflect"
 	"syscall"
 	"time"
 
+	"github.com/ginoh/goal-executor/internal/buildinput"
 	"github.com/ginoh/goal-executor/internal/control"
 	"github.com/ginoh/goal-executor/internal/dockerruntime"
 	"github.com/ginoh/goal-executor/internal/goalfile"
@@ -41,12 +43,9 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 	flags.SetOutput(errOut)
 	goalPath := flags.String("goal", "", "YAML goal file (run)")
 	environment := flags.String("environment", "", "environment to clean up (cleanup)")
-	dbImage := flags.String("db-image", "postgres:17-alpine", "locally available DB image")
-	apiImage := flags.String("api-image", "goal-executor-demo:local", "locally built API image")
-	timeout := flags.Duration("operation-timeout", 90*time.Second, "timeout for each observation, operation, or cleanup")
+	timeout := flags.Duration("operation-timeout", 90*time.Second, "timeout for each observation or operation")
 	interval := flags.Duration("interval", time.Second, "poll interval while achieved or input is invalid")
-	delay := flags.Duration("deploy-delay", 0, "optional delay for demonstrating in-flight goal changes")
-	once := flags.Bool("once", false, "exit successfully when the current goal is achieved")
+	once := flags.Bool("once", false, "exit when the current goal is achieved")
 	if err := flags.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -56,45 +55,49 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 	if flags.NArg() != 0 {
 		return errors.New("unexpected positional arguments")
 	}
-	if *interval <= 0 {
-		return errors.New("interval must be positive")
-	}
-	runtime, err := dockerruntime.New(dockerruntime.Config{DBImage: *dbImage, APIImage: *apiImage, OperationTimeout: *timeout, DeployDelay: *delay})
-	if err != nil {
-		return err
+	if *timeout <= 0 || *interval <= 0 {
+		return errors.New("timeout and interval must be positive")
 	}
 	if args[0] == "cleanup" {
 		if *environment == "" || *goalPath != "" {
 			return errors.New("cleanup requires --environment and does not accept --goal")
 		}
-		if err := runtime.Cleanup(ctx, *environment); err != nil {
+		r, err := dockerruntime.New(dockerruntime.Config{Environment: *environment, OperationTimeout: *timeout})
+		if err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "cleaned environment %s\n", *environment)
-		return nil
+		if err := r.Cleanup(ctx, *environment); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(out, "cleaned environment %s\n", *environment)
+		return err
 	}
 	if *goalPath == "" || *environment != "" {
 		return errors.New("run requires --goal and does not accept --environment")
 	}
-	load := func(context.Context) (planning.Goal, error) {
-		g, err := goalfile.Load(*goalPath)
-		if err != nil {
-			return g, err
-		}
-		if err := dockerruntime.ValidateEnvironment(g.Environment); err != nil {
-			return g, err
-		}
-		if g.Dataset != dockerruntime.Dataset || (g.APIVersion != "v1" && g.APIVersion != "v2") {
-			return g, errors.New("demo supports dataset sample-v1 and API v1/v2")
-		}
-		return g, nil
+	initial, err := goalfile.Load(*goalPath)
+	if err != nil {
+		return err
 	}
+	if err := dockerruntime.ValidateEnvironment(initial.Environment); err != nil {
+		return err
+	}
+	snapshot, err := buildinput.Prepare(*goalPath, initial.Application.Build.Context, initial.Application.Build.Dockerfile)
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(snapshot.Dir)
+	r, err := dockerruntime.New(dockerruntime.Config{Environment: initial.Environment, Build: snapshot, Application: initial.Application, Checks: initial.Checks, OperationTimeout: *timeout})
+	if err != nil {
+		return err
+	}
+	load := fixedGoalLoader(*goalPath, initial, snapshot.ID)
 	loopCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	encoder := json.NewEncoder(out)
 	var achieved bool
 	var outputErr error
-	err = control.Run(loopCtx, load, runtime, control.Options{Interval: *interval, Report: func(e control.Event) {
+	err = control.Run(loopCtx, load, r, control.Options{Interval: *interval, Report: func(e control.Event) {
 		entry := struct {
 			Time   string          `json:"time"`
 			Event  string          `json:"event"`
@@ -126,4 +129,17 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) error {
 		return nil
 	}
 	return err
+}
+
+func fixedGoalLoader(path string, initial goalfile.Document, inputID string) control.LoadGoal {
+	return func(context.Context) (planning.Goal, error) {
+		d, err := goalfile.Load(path)
+		if err != nil {
+			return planning.Goal{}, err
+		}
+		if d.Environment != initial.Environment || !reflect.DeepEqual(d.Application, initial.Application) || !reflect.DeepEqual(d.Checks, initial.Checks) {
+			return planning.Goal{}, errors.New("configuration changed; restore it or restart the CLI")
+		}
+		return planning.Goal{Environment: d.Environment, InputID: inputID, State: d.Goal.State}, nil
+	}
 }

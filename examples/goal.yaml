@@ -1,6 +1,18 @@
 environment: demo
-
-# Changes are read before planning the next operation.
-apiVersion: v1
-dataset: sample-v1
-requireIntegrationTest: true
+application:
+  build:
+    context: ..
+    dockerfile: examples/demo/Dockerfile
+  port: 8080
+checks:
+  readiness:
+    http:
+      path: /health
+      status: 200
+  verification:
+    http:
+      path: /message
+      status: 200
+      bodyEquals: hello
+goal:
+  state: verified
